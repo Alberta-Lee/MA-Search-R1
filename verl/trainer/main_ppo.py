@@ -77,7 +77,14 @@ class RewardManager():
 
             score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, format_score=self.format_score)
 
-            reward_tensor[i, valid_response_length - 1] = score
+            # Fix: Handle multi-agent case where response length may exceed reward_tensor size
+            # In multi-agent mode, total response length (Planner + Explorers + Synthesizer) 
+            # can exceed max_response_length, so we need to clamp the index
+            reward_tensor_size = reward_tensor.shape[1]
+            reward_index = min(valid_response_length - 1, reward_tensor_size - 1)
+            if reward_index < 0:
+                reward_index = 0
+            reward_tensor[i, reward_index] = score
             # all_scores.append(score)
 
             if data_source not in already_print_data_sources:

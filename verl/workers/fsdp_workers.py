@@ -462,6 +462,17 @@ class ActorRolloutRefWorker(Worker):
             # perform recompute log_prob
             with self.ulysses_sharding_manager:
                 output = self.ulysses_sharding_manager.preprocess_data(output)
+                # CRITICAL: Ensure all integer tensors (input_ids, position_ids, attention_mask) are long type
+                # This fixes the issue where preprocess_data may change tensor dtype to bfloat16
+                for key in output.batch.keys():
+                    tensor = output.batch[key]
+                    # Only convert integer-like tensors (input_ids, position_ids, attention_mask, responses)
+                    if key in ('input_ids', 'position_ids', 'attention_mask', 'responses', 'prompts'):
+                        if tensor.dtype not in (torch.long, torch.int, torch.int32, torch.int64):
+                            output.batch[key] = tensor.long()
+                        else:
+                            # Ensure it's long type
+                            output.batch[key] = tensor.long()
                 old_log_probs = self.actor.compute_log_prob(data=output)
                 output.batch['old_log_probs'] = old_log_probs
                 output = self.ulysses_sharding_manager.postprocess_data(output)

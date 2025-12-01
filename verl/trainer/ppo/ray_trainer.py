@@ -454,13 +454,72 @@ class RayPPOTrainer(object):
             topk = self.config.retriever.topk,
         )
 
+        # Check if multi-agent mode is enabled for validation
+        # OmegaConf config access
+        try:
+            if hasattr(self.config, 'multi_agent'):
+                multi_agent_config = self.config.multi_agent
+            else:
+                multi_agent_config = self.config.get('multi_agent', {})
+        except:
+            multi_agent_config = {}
+        
+        # Access enabled flag safely
+        if hasattr(multi_agent_config, 'enabled'):
+            multi_agent_enabled = bool(multi_agent_config.enabled)
+        elif isinstance(multi_agent_config, dict):
+            multi_agent_enabled = multi_agent_config.get('enabled', False)
+        else:
+            multi_agent_enabled = False
+        
+        # Convert OmegaConf to dict if needed
+        if hasattr(multi_agent_config, '_content'):
+            multi_agent_config = dict(multi_agent_config)
+        elif not isinstance(multi_agent_config, dict):
+            try:
+                from omegaconf import OmegaConf
+                multi_agent_config = OmegaConf.to_container(multi_agent_config, resolve=True) or {}
+            except:
+                multi_agent_config = {}
+        
+        if multi_agent_enabled:
+            num_explorers = multi_agent_config.get('num_explorers', 2) if isinstance(multi_agent_config, dict) else getattr(multi_agent_config, 'num_explorers', 2)
+            max_rounds = multi_agent_config.get('max_explore_rounds', 2) if isinstance(multi_agent_config, dict) else getattr(multi_agent_config, 'max_explore_rounds', 2)
+            print(f"[CoSearch-R1] Validation: Multi-agent mode enabled: {num_explorers} Explorers, {max_rounds} rounds")
+        else:
+            print(f"[DEBUG] Validation: Multi-agent mode is DISABLED. Config: {multi_agent_config}")
+        
         # Agent config preparation
-        generation_manager = LLMGenerationManager(
-            tokenizer=self.tokenizer,
-            actor_rollout_wg=self.actor_rollout_wg,
-            config=gen_config,
-            is_validation = True,
-        )
+        # Import LLMGenerationManager at function level to avoid UnboundLocalError
+        # (it's already imported at module level, but we need to ensure it's available in all branches)
+        from search_r1.llm_agent.generation import LLMGenerationManager
+        
+        if multi_agent_enabled:
+            # Multi-agent mode (CoSearch-R1) for validation
+            from search_r1.multi_agent.rollout import MultiAgentRolloutManager
+            generation_manager = MultiAgentRolloutManager(
+                tokenizer=self.tokenizer,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+                multi_agent_config=multi_agent_config,
+                is_validation=True,
+            )
+            # Set search client (reuse single-agent's search functionality)
+            single_agent_manager = LLMGenerationManager(
+                tokenizer=self.tokenizer,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+                is_validation=True,
+            )
+            generation_manager.set_search_client(single_agent_manager)
+        else:
+            # Single-agent mode (original Search-R1) for validation
+            generation_manager = LLMGenerationManager(
+                tokenizer=self.tokenizer,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+                is_validation = True,
+            )
 
         if not self.config.do_search:
             for test_data in self.val_dataloader:
@@ -512,10 +571,43 @@ class RayPPOTrainer(object):
                     first_input_ids = test_gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
                     with _timer('gen', timing_raw):
                         generation_manager.timing_raw = timing_raw
-                        final_gen_batch_output = generation_manager.run_llm_loop(
-                            gen_batch=test_gen_batch,
-                            initial_input_ids=first_input_ids,
-                        )
+                        
+                        # Check if multi-agent mode
+                        if multi_agent_enabled:
+                            # Multi-agent rollout for validation
+                            batch_size = test_gen_batch.batch['input_ids'].shape[0]
+                            sample_prompts = []
+                            for i in range(batch_size):
+                                prompt_ids = test_gen_batch.batch['input_ids'][i]
+                                prompt_mask = test_gen_batch.batch.get('attention_mask', None)
+                                if prompt_mask is not None and i < prompt_mask.shape[0]:
+                                    valid_length = prompt_mask[i].sum().item()  # Fix: use prompt_mask[i]
+                                    valid_prompt = prompt_ids[:valid_length] if valid_length > 0 else prompt_ids
+                                else:
+                                    # Fallback: find non-pad tokens
+                                    pad_token_id = self.tokenizer.pad_token_id
+                                    non_pad_mask = (prompt_ids != pad_token_id)
+                                    if non_pad_mask.any():
+                                        valid_prompt = prompt_ids[non_pad_mask]
+                                    else:
+                                        valid_prompt = prompt_ids
+                                prompt_text = self.tokenizer.decode(valid_prompt, skip_special_tokens=False)
+                                sample_prompts.append(prompt_text)
+                            
+                            print(f"[CoSearch-R1] Starting validation multi-agent rollout (batch_size={test_gen_batch.batch['input_ids'].shape[0]})")
+                            final_gen_batch_output, trajectory = generation_manager.run_multi_agent_rollout(
+                                gen_batch=test_gen_batch,
+                                initial_input_ids=first_input_ids,
+                                sample_prompts=sample_prompts,
+                                global_step=0,  # Validation step
+                            )
+                            print(f"[CoSearch-R1] Validation multi-agent rollout completed")
+                        else:
+                            # Single-agent rollout (original)
+                            final_gen_batch_output = generation_manager.run_llm_loop(
+                                gen_batch=test_gen_batch,
+                                initial_input_ids=first_input_ids,
+                            )
                     
                     test_batch = test_batch.union(final_gen_batch_output)
                     
@@ -685,11 +777,73 @@ class RayPPOTrainer(object):
             topk = self.config.retriever.topk,
         )
 
-        generation_manager = LLMGenerationManager(
-            tokenizer=self.tokenizer,
-            actor_rollout_wg=self.actor_rollout_wg,
-            config=gen_config,
-        )
+        # Check if multi-agent mode is enabled
+        # Use safe access with default values to ensure backward compatibility
+        # OmegaConf config access
+        try:
+            if hasattr(self.config, 'multi_agent'):
+                multi_agent_config = self.config.multi_agent
+            else:
+                multi_agent_config = self.config.get('multi_agent', {})
+        except:
+            multi_agent_config = {}
+        
+        # Debug: print config to verify
+        print(f"[DEBUG] multi_agent_config type: {type(multi_agent_config)}")
+        print(f"[DEBUG] multi_agent_config: {multi_agent_config}")
+        
+        # Access enabled flag safely
+        if hasattr(multi_agent_config, 'enabled'):
+            multi_agent_enabled = bool(multi_agent_config.enabled)
+        elif isinstance(multi_agent_config, dict):
+            multi_agent_enabled = multi_agent_config.get('enabled', False)
+        else:
+            multi_agent_enabled = False
+        
+        print(f"[DEBUG] multi_agent_enabled: {multi_agent_enabled}")
+        
+        # Convert OmegaConf to dict if needed
+        if hasattr(multi_agent_config, '_content'):
+            multi_agent_config = dict(multi_agent_config)
+        elif not isinstance(multi_agent_config, dict):
+            try:
+                from omegaconf import OmegaConf
+                multi_agent_config = OmegaConf.to_container(multi_agent_config, resolve=True) or {}
+            except:
+                multi_agent_config = {}
+        
+        # Store multi_agent_config for later use
+        self.multi_agent_config = multi_agent_config
+        
+        if multi_agent_enabled:
+            num_explorers = multi_agent_config.get('num_explorers', 2) if isinstance(multi_agent_config, dict) else getattr(multi_agent_config, 'num_explorers', 2)
+            max_rounds = multi_agent_config.get('max_explore_rounds', 2) if isinstance(multi_agent_config, dict) else getattr(multi_agent_config, 'max_explore_rounds', 2)
+            print(f"[CoSearch-R1] Initializing multi-agent mode: {num_explorers} Explorers, {max_rounds} rounds")
+            # Multi-agent mode (CoSearch-R1)
+            from search_r1.multi_agent.rollout import MultiAgentRolloutManager
+            generation_manager = MultiAgentRolloutManager(
+                tokenizer=self.tokenizer,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+                multi_agent_config=multi_agent_config,
+                is_validation=False,
+            )
+            # Set search client (reuse single-agent's search functionality)
+            from search_r1.llm_agent.generation import LLMGenerationManager
+            single_agent_manager = LLMGenerationManager(
+                tokenizer=self.tokenizer,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+            )
+            generation_manager.set_search_client(single_agent_manager)
+        else:
+            print(f"[DEBUG] Multi-agent mode is DISABLED. Config: {multi_agent_config}")
+            # Single-agent mode (original Search-R1)
+            generation_manager = LLMGenerationManager(
+                tokenizer=self.tokenizer,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+            )
 
         # start training loop
         for epoch in range(self.config.trainer.total_epochs):
@@ -726,10 +880,44 @@ class RayPPOTrainer(object):
 
                         with _timer('gen', timing_raw):
                             generation_manager.timing_raw = timing_raw
-                            final_gen_batch_output = generation_manager.run_llm_loop(
-                                gen_batch=gen_batch,
-                                initial_input_ids=first_input_ids,
-                            )
+                            
+                            # Check if multi-agent mode
+                            if multi_agent_enabled:
+                                # Multi-agent rollout (CoSearch-R1)
+                                if self.global_steps == 0 or self.global_steps % 100 == 0:
+                                    print(f"[CoSearch-R1] Multi-agent mode enabled: {self.multi_agent_config.get('num_explorers', 2)} Explorers, {self.multi_agent_config.get('max_explore_rounds', 2)} rounds")
+                                # Extract prompts for multi-agent template
+                                batch_size = gen_batch.batch['input_ids'].shape[0]
+                                sample_prompts = []
+                                for i in range(batch_size):
+                                    prompt_ids = gen_batch.batch['input_ids'][i]
+                                    prompt_mask = gen_batch.batch.get('attention_mask', None)
+                                    if prompt_mask is not None and i < prompt_mask.shape[0]:
+                                        valid_length = prompt_mask[i].sum().item()  # Fix: use prompt_mask[i]
+                                        valid_prompt = prompt_ids[:valid_length] if valid_length > 0 else prompt_ids
+                                    else:
+                                        # Fallback: find non-pad tokens
+                                        pad_token_id = self.tokenizer.pad_token_id
+                                        non_pad_mask = (prompt_ids != pad_token_id)
+                                        if non_pad_mask.any():
+                                            valid_prompt = prompt_ids[non_pad_mask]
+                                        else:
+                                            valid_prompt = prompt_ids
+                                    prompt_text = self.tokenizer.decode(valid_prompt, skip_special_tokens=False)
+                                    sample_prompts.append(prompt_text)
+                                
+                                final_gen_batch_output, trajectory = generation_manager.run_multi_agent_rollout(
+                                    gen_batch=gen_batch,
+                                    initial_input_ids=first_input_ids,
+                                    sample_prompts=sample_prompts,
+                                    global_step=self.global_steps,
+                                )
+                            else:
+                                # Single-agent rollout (original)
+                                final_gen_batch_output = generation_manager.run_llm_loop(
+                                    gen_batch=gen_batch,
+                                    initial_input_ids=first_input_ids,
+                                )
 
                         # final_gen_batch_output.batch.apply(lambda x: x.long(), inplace=True)
                         for key in final_gen_batch_output.batch.keys():

@@ -178,3 +178,12 @@ trainer:
 
 max_turns: 10
 do_search: true
+
+multi_agent:
+  enabled: false  # Set to true to enable multi-agent mode (CoSearch-R1)
+  num_explorers: 2  # Number of Explorer agents
+  max_explore_rounds: 2  # Maximum number of exploration rounds
+  roles: ["Planner", "Explorer", "Synthesizer"]  # Agent roles
+  show_steps: false  # Whether to show intermediate steps during training
+  log_sample_count: 2  # Number of samples to log (when show_steps=true)
+  log_step_freq: 1  # Log every N steps (0 = only first step, when show_steps=true)
